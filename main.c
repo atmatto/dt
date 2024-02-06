@@ -43,15 +43,14 @@ typedef struct State { // TODO: Some members are probably unneeded
 	VkSwapchainKHR vsch;
 	uint32_t vschimgc; // number of images in swapchain
 	VkImage *vschimg; // array of swapchain images
+	VkImageView *vschimgv;
 	VkQueue queue;
-	VkRenderPass rp;
 	VkPipeline pl;
 	VkCommandPool cmdpl;
 	VkCommandBuffer *cmdb;
 	VkSemaphore *imgsem; // image is ready to be drawn to
 	VkSemaphore *prsem; // ready to present
 	VkFence *cmdbfen; // ready to reuse cmd buffer
-	VkFramebuffer *fb;
 	VkExtent2D imgext;
 } State;
 
@@ -149,13 +148,13 @@ void beginVulkan(State *s) {
 	
 	VkApplicationInfo ai = {};
 	ai.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-	ai.apiVersion = VK_VERSION_1_3;
+	ai.apiVersion = VK_API_VERSION_1_3;
 
 	const char *layers[] = {
-		"VK_LAYER_KHRONOS_validation"
+		"VK_LAYER_KHRONOS_validation",
 	};
 	const char *iextensions[16] = { // remember to update the count in iextc
-		"VK_KHR_surface",
+		VK_KHR_SURFACE_EXTENSION_NAME,
 	};
 
 	uint32_t sdlextc = 0;
@@ -200,8 +199,7 @@ void beginVulkan(State *s) {
 	// check required device extensions
 
 	const char *dextensions[] = {
-		// "VK_KHR_synchronization2" TODO this was promotted and thus not needed?
-		"VK_KHR_swapchain",
+		VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 	};
 
 	char extOk = checkDevExtensions(pd, LENGTH(dextensions), dextensions);
@@ -239,8 +237,18 @@ void beginVulkan(State *s) {
 
 	// create device
 
+	VkPhysicalDeviceSynchronization2Features s2f = {};
+	s2f.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SYNCHRONIZATION_2_FEATURES;
+	s2f.synchronization2 = VK_TRUE;
+
+	VkPhysicalDeviceDynamicRenderingFeatures drf = {};
+	drf.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES;
+	drf.pNext = &s2f;
+	drf.dynamicRendering = VK_TRUE;
+
 	VkDeviceCreateInfo di = {};
 	di.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+	di.pNext = &drf;
 	di.queueCreateInfoCount = 1;
 	di.pQueueCreateInfos = (VkDeviceQueueCreateInfo[]){qci};
 	di.enabledExtensionCount = LENGTH(dextensions);
@@ -333,8 +341,8 @@ void beginVulkan(State *s) {
 
 	// create swapchain image views
 
-	VkImageView *schimgv = calloc(schimgc, sizeof(VkImageView));
-	mustPtr(schimgv, "swapchain image views array, len = %"PRIu32, schimgc);
+	s->vschimgv = calloc(schimgc, sizeof(VkImageView));
+	mustPtr(s->vschimgv, "swapchain image views array, len = %"PRIu32, schimgc);
 	for (uint32_t i = 0; i < schimgc; i++) {
 		VkImageViewCreateInfo ivci = {};
 		ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -346,50 +354,8 @@ void beginVulkan(State *s) {
 		ivci.subresourceRange.levelCount = 1;
 		ivci.subresourceRange.baseArrayLayer = 0;
 		ivci.subresourceRange.layerCount = 1;
-		must(vkCreateImageView(dev, &ivci, NULL, &schimgv[i]));
+		must(vkCreateImageView(dev, &ivci, NULL, &s->vschimgv[i]));
 	}
-
-	// create attachments
-
-	VkAttachmentDescription atd = {};
-	atd.format = VK_FORMAT_B8G8R8A8_SRGB;
-	atd.samples = VK_SAMPLE_COUNT_1_BIT;
-	atd.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-	atd.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-	atd.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-	atd.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-	atd.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	atd.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-	VkAttachmentReference atr = {};
-	atr.attachment = 0;
-	atr.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-	// create subpasses
-
-	VkSubpassDescription spd = {};
-	spd.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-	spd.colorAttachmentCount = 1;
-	spd.pColorAttachments = &atr;
-
-	// create render pass
-
-	VkSubpassDependency dep = {};
-	dep.srcSubpass = VK_SUBPASS_EXTERNAL;
-	dep.dstSubpass = 0;
-	dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-	dep.srcAccessMask = 0;
-	dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-	dep.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-	VkRenderPassCreateInfo rpci = {};
-	rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-	rpci.attachmentCount = 1;
-	rpci.pAttachments = &atd;
-	rpci.subpassCount = 1;
-	rpci.pSubpasses = &spd;
-	rpci.dependencyCount = 1;
-	rpci.pDependencies = &dep;
-	vkCreateRenderPass(dev, &rpci, NULL, &s->rp);
 
 	// create shaders
 
@@ -421,8 +387,14 @@ void beginVulkan(State *s) {
 
 	// create graphics pipeline
 
+	VkPipelineRenderingCreateInfo plrci = {};
+	plrci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+	plrci.colorAttachmentCount = 1;
+	plrci.pColorAttachmentFormats = &srffchosen->format;
+
 	VkGraphicsPipelineCreateInfo plci = {};
 	plci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+	plci.pNext = &plrci;
 	plci.stageCount = LENGTH(psci);
 	plci.pStages = psci;
 	plci.pVertexInputState = &(VkPipelineVertexInputStateCreateInfo){
@@ -477,33 +449,17 @@ void beginVulkan(State *s) {
 	VkPipelineLayout plly;
 	must(vkCreatePipelineLayout(dev, &pllyci, NULL, &plly));
 	plci.layout = plly;
-	plci.renderPass = s->rp;
-	plci.subpass = 0;
+	// plci.renderPass = s->rp;
+	// plci.subpass = 0;
 	plci.basePipelineHandle = VK_NULL_HANDLE;
 	plci.basePipelineIndex = 0;
 	must(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &plci, NULL, &s->pl));
-
-	// create framebuffers
-
-	s->fb = calloc(schimgc, sizeof(VkFramebuffer));
-	mustPtr(s->fb, "framebuffers array, len = %"PRIu32, schimgc);
-	for (uint32_t i = 0; i < schimgc; i++) {
-		VkFramebufferCreateInfo fbci = {};
-		fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-		fbci.renderPass = s->rp;
-		fbci.attachmentCount = 1;
-		fbci.pAttachments = &schimgv[i];
-		fbci.width = imgext.width;
-		fbci.height = imgext.height;
-		fbci.layers = 1;
-		must(vkCreateFramebuffer(dev, &fbci, NULL, &s->fb[i]));
-	}
 
 	// create command pool
 
 	VkCommandPoolCreateInfo cmdplci = {};
 	cmdplci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-	cmdplci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT; // TODO: Transient?
+	cmdplci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 	cmdplci.queueFamilyIndex = qfi;
 	must(vkCreateCommandPool(dev, &cmdplci, NULL, &s->cmdpl));
 
@@ -559,50 +515,107 @@ void eventLoop(State *s) {
 	char quit = 0;
 	uint32_t schimgi = 0;
 	uint32_t schi = 0;
+
+	VkRenderingAttachmentInfo ati = {};
+	ati.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+	ati.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	ati.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	ati.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+	ati.clearValue = (VkClearValue){
+		.color = (VkClearColorValue){.float32 = {1, 1, 1, 1}},
+	};
+
+	VkRenderingInfo ri = {};
+	ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+	ri.renderArea.extent = s->imgext;
+	ri.layerCount = 1;
+	ri.colorAttachmentCount = 1;
+	ri.pColorAttachments = &ati;
+	// TODO const VkRenderingAttachmentInfo*    pDepthAttachment;
+
+	VkViewport vp = {};
+	vp.width = s->imgext.width;
+	vp.height = s->imgext.height;
+	vp.minDepth = 0;
+	vp.maxDepth = 1;
+
+	VkRect2D sc = {};
+	sc.extent = s->imgext;
+
+	VkImageMemoryBarrier imb1 = {};
+	imb1.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	imb1.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	imb1.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	imb1.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
+	imb1.image = s->vschimg[schimgi];
+	imb1.subresourceRange = (VkImageSubresourceRange){
+		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		.baseMipLevel = 0,
+		.levelCount = 1,
+		.baseArrayLayer = 0,
+		.layerCount = 1,
+	};
+	VkImageMemoryBarrier imb = {};
+	imb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	imb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	imb.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	imb.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+	imb.image = s->vschimg[schimgi];
+	imb.subresourceRange = (VkImageSubresourceRange){
+		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+		.baseMipLevel = 0,
+		.levelCount = 1,
+		.baseArrayLayer = 0,
+		.layerCount = 1,
+	};
+
 	while (!quit) {
 		while (SDL_PollEvent(&e) != 0) {
 			if (e.type == SDL_QUIT) quit = 1;
 		}
 
-		// quit = 1; // TODO: Delete when ready
+		// acquire image from swap chain, wait for an available command buffer
 
-		// acquire image from swap chain
 		must(vkAcquireNextImageKHR(s->vdev, s->vsch, 3000000000, s->imgsem[schi], VK_NULL_HANDLE, &schimgi));
-
-		// record command buffer
-
 		vkWaitForFences(s->vdev, 1, &s->cmdbfen[schi], VK_TRUE, UINT64_MAX);
 		vkResetFences(s->vdev, 1, &s->cmdbfen[schi]);
 		printFramerate();
-		// must(vkResetCommandBuffer(s->cmdb[schi], 0)); TODO this is not needed?
+
+		// record command buffer
+
+		// TODO: synchronization2
+
 		must(vkBeginCommandBuffer(s->cmdb[schi], &(VkCommandBufferBeginInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}));
 
-		VkRenderPassBeginInfo rpbi = {};
-		rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-		rpbi.renderPass = s->rp;
-		rpbi.framebuffer = s->fb[schimgi];
-		rpbi.renderArea.extent = s->imgext;
-		rpbi.clearValueCount = 1;
-		rpbi.pClearValues = &(VkClearValue){
-			.color = (VkClearColorValue){.float32 = {1, 1, 1, 1}},
-		};
-		vkCmdBeginRenderPass(s->cmdb[schi], &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+		imb1.image = s->vschimg[schimgi];
+		imb.image = s->vschimg[schimgi];
+		vkCmdPipelineBarrier(
+			s->cmdb[schi],
+			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+			0, 0, NULL, 0, NULL, 1, &imb1
+		);
+		
+		ati.imageView = s->vschimgv[schimgi];
+
+		vkCmdBeginRendering(s->cmdb[schi], &ri);
+
+		ri.renderArea.extent = s->imgext;
+		vp.width = s->imgext.width;
+		vp.height = s->imgext.height;
+		vkCmdSetViewport(s->cmdb[schi], 0, 1, &vp);
+		vkCmdSetScissor(s->cmdb[schi], 0, 1, &sc);
 
 		vkCmdBindPipeline(s->cmdb[schi], VK_PIPELINE_BIND_POINT_GRAPHICS, s->pl);
 
-		VkViewport vp = {};
-		vp.width = s->imgext.width;
-		vp.height = s->imgext.height;
-		vp.minDepth = 0;
-		vp.maxDepth = 1;
-		vkCmdSetViewport(s->cmdb[schi], 0, 1, &vp);
-
-		VkRect2D sc = {};
-		sc.extent = s->imgext;
-		vkCmdSetScissor(s->cmdb[schi], 0, 1, &sc);
-
 		vkCmdDraw(s->cmdb[schi], 3, 1, 0, 0);
-		vkCmdEndRenderPass(s->cmdb[schi]);
+		vkCmdEndRendering(s->cmdb[schi]);
+
+		vkCmdPipelineBarrier(
+			s->cmdb[schi],
+			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+			0, 0, NULL, 0, NULL, 1, &imb
+		);
+
 		must(vkEndCommandBuffer(s->cmdb[schi]));
 
 		// submit command buffer
@@ -620,7 +633,7 @@ void eventLoop(State *s) {
 		must(vkQueueSubmit(s->queue, 1, &si, s->cmdbfen[schi]));
 
 		// present swap chain image
-		// BUG: we assume that the queue supports present
+
 		VkPresentInfoKHR pi = {};
 		pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
 		pi.waitSemaphoreCount = 1;
