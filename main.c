@@ -1,3 +1,4 @@
+#include "SDL_video.h"
 #include "vulkan_core.h"
 #include <SDL.h>
 #include <SDL_vulkan.h>
@@ -40,6 +41,7 @@
 typedef struct State { // TODO: Some members are probably unneeded
 	SDL_Window *window;
 	VkDevice vdev;
+	VkPhysicalDevice vpd;
 	VkSwapchainKHR vsch;
 	uint32_t vschimgc; // number of images in swapchain
 	VkImage *vschimg; // array of swapchain images
@@ -52,6 +54,8 @@ typedef struct State { // TODO: Some members are probably unneeded
 	VkSemaphore *prsem; // ready to present
 	VkFence *cmdbfen; // ready to reuse cmd buffer
 	VkExtent2D imgext;
+	VkSurfaceKHR vsurface;
+	VkSurfaceFormatKHR vsurff;
 } State;
 
 // initialize sdl and setup window
@@ -142,6 +146,98 @@ char checkDevExtensions(VkPhysicalDevice dev, uint32_t count, const char *exts[]
 	return found == count;
 }
 
+void createSwapchain(State *s) {
+	// initialize swapchain
+
+	if (s->vschimgc == 0) { // BUG: We assume that the format won't change
+		uint32_t srffc;
+		must(vkGetPhysicalDeviceSurfaceFormatsKHR(s->vpd, s->vsurface, &srffc, NULL));
+		VkSurfaceFormatKHR *srff = calloc(srffc, sizeof(VkSurfaceFormatKHR));
+		mustPtr(srff, "physical device surface formats array, len = %"PRIu32, srffc);
+		must(vkGetPhysicalDeviceSurfaceFormatsKHR(s->vpd, s->vsurface, &srffc, srff));
+		s->vsurff = srff[0];
+		for (uint32_t i = 0; i < srffc; i++) {
+			if (srff[i].format == VK_FORMAT_B8G8R8A8_SRGB && srff[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
+				s->vsurff = srff[i];
+		}
+		free(srff);
+	}
+
+	VkSurfaceCapabilitiesKHR srfcap = {};
+	must(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s->vpd, s->vsurface, &srfcap));
+
+	uint32_t imgc = 3;
+	if (imgc < srfcap.minImageCount)
+		imgc = srfcap.minImageCount;
+	if (imgc > srfcap.maxImageCount)
+		imgc = srfcap.maxImageCount;
+
+	VkExtent2D imgext = {1920, 1080};
+	if (srfcap.currentExtent.width != 0xFFFFFFFF || srfcap.currentExtent.height != 0xFFFFFFFF) {
+		imgext = srfcap.currentExtent;
+	} else {
+		if (imgext.width > srfcap.maxImageExtent.width)
+			imgext.width = srfcap.maxImageExtent.width;
+		if (imgext.height > srfcap.maxImageExtent.height)
+			imgext.height = srfcap.maxImageExtent.height;
+		if (imgext.width < srfcap.minImageExtent.width)
+			imgext.width = srfcap.minImageExtent.width;
+		if (imgext.height < srfcap.minImageExtent.height)
+			imgext.height = srfcap.minImageExtent.height;
+	}
+	s->imgext = imgext;
+
+	VkSwapchainCreateInfoKHR schci = {};
+	schci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+	schci.surface = s->vsurface;
+	schci.minImageCount = 3; // TODO: Think about choosing the right number
+	schci.imageFormat = s->vsurff.format;
+	schci.imageColorSpace = s->vsurff.colorSpace;
+	schci.imageExtent = imgext;
+	schci.imageArrayLayers = 1;
+	schci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+	schci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+	schci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+	schci.presentMode = VK_PRESENT_MODE_MAILBOX_KHR; // TODO: either FIFO Relaxed or Mailbox, with FIFO as fallback maybe
+
+	must(vkCreateSwapchainKHR(s->vdev, &schci, NULL, &s->vsch));
+
+	// get swapchain image handles
+
+	must(vkGetSwapchainImagesKHR(s->vdev, s->vsch, &s->vschimgc, NULL));
+	if (s->vschimg != NULL) {
+		s->vschimg = reallocarray(s->vschimg, s->vschimgc, sizeof(VkImage));
+	} else {
+		s->vschimg = calloc(s->vschimgc, sizeof(VkImage));
+	}
+	mustPtr(s->vschimg, "swapchain images array, len = %"PRIu32, s->vschimgc);
+	must(vkGetSwapchainImagesKHR(s->vdev, s->vsch, &s->vschimgc, s->vschimg));
+
+	// create swapchain image views
+
+	if (s->vschimgv != NULL) {
+		s->vschimgv = reallocarray(s->vschimgv, s->vschimgc, sizeof(VkImageView));
+	} else {
+		s->vschimgv = calloc(s->vschimgc, sizeof(VkImageView));
+	}
+	mustPtr(s->vschimgv, "swapchain image views array, len = %"PRIu32, s->vschimgc);
+	for (uint32_t i = 0; i < s->vschimgc; i++) {
+		VkImageViewCreateInfo ivci = {};
+		ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		ivci.image = s->vschimg[i];
+		ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+		ivci.format = s->vsurff.format;
+		ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		ivci.subresourceRange.baseMipLevel = 0;
+		ivci.subresourceRange.levelCount = 1;
+		ivci.subresourceRange.baseArrayLayer = 0;
+		ivci.subresourceRange.layerCount = 1;
+		must(vkCreateImageView(s->vdev, &ivci, NULL, &s->vschimgv[i]));
+	}
+
+	infof("swapchain created (%"PRIu32" images, %"PRIu32"x%"PRIu32")", s->vschimgc, imgext.width, imgext.height);
+}
+
 // initialize vulkan
 void beginVulkan(State *s) {
 	// create instance
@@ -194,7 +290,7 @@ void beginVulkan(State *s) {
 	must(vkEnumeratePhysicalDevices(instance, &physdc, pdevs));
 
 	uint32_t physdi = chooseDevice(physdc, pdevs);
-	VkPhysicalDevice pd = pdevs[physdi];
+	s->vpd = pdevs[physdi];
 
 	// check required device extensions
 
@@ -202,7 +298,7 @@ void beginVulkan(State *s) {
 		VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 	};
 
-	char extOk = checkDevExtensions(pd, LENGTH(dextensions), dextensions);
+	char extOk = checkDevExtensions(s->vpd, LENGTH(dextensions), dextensions);
 	if (!extOk) {
 		panicf("gpu doesn't support required device extensions");
 	}
@@ -210,13 +306,13 @@ void beginVulkan(State *s) {
 	// create queues
 
 	uint32_t qfamc;
-	vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfamc, NULL);
+	vkGetPhysicalDeviceQueueFamilyProperties(s->vpd, &qfamc, NULL);
 	if (qfamc == 0) {
 		panicf("no queue families available");
 	}
 	VkQueueFamilyProperties *qfamp = calloc(qfamc, sizeof(VkQueueFamilyProperties));
 	mustPtr(qfamp, "queue family properties array, len = %"PRIu32, qfamc);
-	vkGetPhysicalDeviceQueueFamilyProperties(pd, &qfamc, qfamp);
+	vkGetPhysicalDeviceQueueFamilyProperties(s->vpd, &qfamc, qfamp);
 	uint32_t qfi = qfamc;
 	for (uint32_t i = 0; i < qfamc; i++)
 		if ((qfamp[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT|VK_QUEUE_COMPUTE_BIT))
@@ -255,7 +351,7 @@ void beginVulkan(State *s) {
 	di.ppEnabledExtensionNames = dextensions;
 	
 	VkDevice dev;
-	must(vkCreateDevice(pd, &di, NULL, &dev));
+	must(vkCreateDevice(s->vpd, &di, NULL, &dev));
 	s->vdev = dev;
 
 	infof("vulkan device created");
@@ -266,95 +362,8 @@ void beginVulkan(State *s) {
 
 	// create vulkan rendering surface
 
-	VkSurfaceKHR surface;
-	if (SDL_Vulkan_CreateSurface(s->window, instance, &surface) != SDL_TRUE) {
+	if (SDL_Vulkan_CreateSurface(s->window, instance, &s->vsurface) != SDL_TRUE) {
 		panicf("failed to create a vulkan surface using sdl2");
-	}
-
-	// initialize swapchain
-
-	uint32_t srffc;
-	must(vkGetPhysicalDeviceSurfaceFormatsKHR(pd, surface, &srffc, NULL));
-	VkSurfaceFormatKHR *srff = calloc(srffc, sizeof(VkSurfaceFormatKHR));
-	mustPtr(srff, "physical device surface formats array, len = %"PRIu32, srffc);
-	must(vkGetPhysicalDeviceSurfaceFormatsKHR(pd, surface, &srffc, srff));
-	VkSurfaceFormatKHR *srffchosen = &srff[0];
-	for (uint32_t i = 0; i < srffc; i++) {
-		if (srff[i].format == VK_FORMAT_B8G8R8A8_SRGB && srff[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
-			srffchosen = &srff[i];
-	}
-
-	VkSurfaceCapabilitiesKHR srfcap = {};
-	must(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(pd, surface, &srfcap));
-
-	uint32_t imgc = 3;
-	if (imgc < srfcap.minImageCount)
-		imgc = srfcap.minImageCount;
-	if (imgc > srfcap.maxImageCount)
-		imgc = srfcap.maxImageCount;
-
-	VkExtent2D imgext = {1920, 1080}; // TODO: Make this configurable
-	if (srfcap.currentExtent.width != 0xFFFFFFFF || srfcap.currentExtent.height != 0xFFFFFFFF) {
-		imgext = srfcap.currentExtent;
-	} else {
-		if (imgext.width > srfcap.maxImageExtent.width)
-			imgext.width = srfcap.maxImageExtent.width;
-		if (imgext.height > srfcap.maxImageExtent.height)
-			imgext.height = srfcap.maxImageExtent.height;
-		if (imgext.width < srfcap.minImageExtent.width)
-			imgext.width = srfcap.minImageExtent.width;
-		if (imgext.height < srfcap.minImageExtent.height)
-			imgext.height = srfcap.minImageExtent.height;
-	}
-	s->imgext = imgext;
-	infof("chosen swapchain image extents: %"PRIu32"x%"PRIu32, imgext.width, imgext.height);
-
-	VkSwapchainCreateInfoKHR schci = {};
-	schci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
-	schci.surface = surface;
-	schci.minImageCount = 3; // TODO: Think about choosing the right number
-	schci.imageFormat = srffchosen->format;
-	schci.imageColorSpace = srffchosen->colorSpace;
-	schci.imageExtent = imgext;
-	schci.imageArrayLayers = 1;
-	schci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-	schci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-	schci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-	schci.presentMode = VK_PRESENT_MODE_MAILBOX_KHR; // TODO: either FIFO Relaxed or Mailbox, with FIFO as fallback maybe
-
-	VkSwapchainKHR sch;
-	must(vkCreateSwapchainKHR(dev, &schci, NULL, &sch));
-	infof("vulkan swapchain created");
-
-	// get swapchain image handles
-
-	uint32_t schimgc;
-	must(vkGetSwapchainImagesKHR(dev, sch, &schimgc, NULL));
-	VkImage *schimg = calloc(schimgc, sizeof(VkImage));
-	mustPtr(schimg, "swapchain images array, len = %"PRIu32, schimgc);
-	must(vkGetSwapchainImagesKHR(dev, sch, &schimgc, schimg));
-	infof("obtained %"PRIu32" swapchain images", schimgc);
-
-	s->vsch = sch;
-	s->vschimgc = schimgc;
-	s->vschimg = schimg;
-
-	// create swapchain image views
-
-	s->vschimgv = calloc(schimgc, sizeof(VkImageView));
-	mustPtr(s->vschimgv, "swapchain image views array, len = %"PRIu32, schimgc);
-	for (uint32_t i = 0; i < schimgc; i++) {
-		VkImageViewCreateInfo ivci = {};
-		ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-		ivci.image = s->vschimg[i];
-		ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-		ivci.format = srffchosen->format;
-		ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		ivci.subresourceRange.baseMipLevel = 0;
-		ivci.subresourceRange.levelCount = 1;
-		ivci.subresourceRange.baseArrayLayer = 0;
-		ivci.subresourceRange.layerCount = 1;
-		must(vkCreateImageView(dev, &ivci, NULL, &s->vschimgv[i]));
 	}
 
 	// create shaders
@@ -385,12 +394,16 @@ void beginVulkan(State *s) {
 
 	VkPipelineShaderStageCreateInfo psci[] = {vspsci, fspsci};
 
+	// create swapchain
+
+	createSwapchain(s);
+
 	// create graphics pipeline
 
 	VkPipelineRenderingCreateInfo plrci = {};
 	plrci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
 	plrci.colorAttachmentCount = 1;
-	plrci.pColorAttachmentFormats = &srffchosen->format;
+	plrci.pColorAttachmentFormats = &s->vsurff.format;
 
 	VkGraphicsPipelineCreateInfo plci = {};
 	plci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -465,31 +478,31 @@ void beginVulkan(State *s) {
 
 	// allocate command buffers
 
-	s->cmdb = calloc(schimgc, sizeof(VkCommandBuffer));
-	mustPtr(s->cmdb, "command buffers array, len = %"PRIu32, schimgc);
+	s->cmdb = calloc(s->vschimgc, sizeof(VkCommandBuffer));
+	mustPtr(s->cmdb, "command buffers array, len = %"PRIu32, s->vschimgc);
 	VkCommandBufferAllocateInfo cmdbai = {};
 	cmdbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
 	cmdbai.commandPool = s->cmdpl;
 	cmdbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	cmdbai.commandBufferCount = schimgc;
+	cmdbai.commandBufferCount = s->vschimgc;
 	must(vkAllocateCommandBuffers(dev, &cmdbai, s->cmdb));
 
 	// create semaphores and fences
 
-	s->imgsem = calloc(schimgc, sizeof(VkSemaphore));
-	mustPtr(s->imgsem, "image semaphores array, len = %"PRIu32, schimgc);
-	for (uint32_t i = 0; i < schimgc; i++)
+	s->imgsem = calloc(s->vschimgc, sizeof(VkSemaphore));
+	mustPtr(s->imgsem, "image semaphores array, len = %"PRIu32, s->vschimgc);
+	for (uint32_t i = 0; i < s->vschimgc; i++)
 		must(vkCreateSemaphore(dev, &(VkSemaphoreCreateInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}, NULL, &s->imgsem[i]));
-	s->prsem = calloc(schimgc, sizeof(VkSemaphore));
-	mustPtr(s->prsem, "present semaphores array, len = %"PRIu32, schimgc);
-	for (uint32_t i = 0; i < schimgc; i++)
+	s->prsem = calloc(s->vschimgc, sizeof(VkSemaphore));
+	mustPtr(s->prsem, "present semaphores array, len = %"PRIu32, s->vschimgc);
+	for (uint32_t i = 0; i < s->vschimgc; i++)
 		must(vkCreateSemaphore(dev, &(VkSemaphoreCreateInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}, NULL, &s->prsem[i]));
-	s->cmdbfen = calloc(schimgc, sizeof(VkFence));
-	mustPtr(s->prsem, "command buffer fences array, len = %"PRIu32, schimgc);
+	s->cmdbfen = calloc(s->vschimgc, sizeof(VkFence));
+	mustPtr(s->prsem, "command buffer fences array, len = %"PRIu32, s->vschimgc);
 	VkFenceCreateInfo cmdbfenci = {};
 	cmdbfenci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
 	cmdbfenci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-	for (uint32_t i = 0; i < schimgc; i++)
+	for (uint32_t i = 0; i < s->vschimgc; i++)
 		must(vkCreateFence(dev, &cmdbfenci, NULL, &s->cmdbfen[i]));
 }
 
@@ -513,6 +526,7 @@ void printFramerate() {
 void eventLoop(State *s) {
 	SDL_Event e;
 	char quit = 0;
+	char resize = 0;
 	uint32_t schimgi = 0;
 	uint32_t schi = 0;
 
@@ -542,12 +556,15 @@ void eventLoop(State *s) {
 	VkRect2D sc = {};
 	sc.extent = s->imgext;
 
-	VkImageMemoryBarrier imb1 = {};
-	imb1.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	imb1.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+	VkImageMemoryBarrier2 imb1 = {};
+	imb1.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+	imb1.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+	imb1.srcAccessMask = VK_ACCESS_2_NONE;
+	imb1.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+	imb1.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
 	imb1.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	imb1.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
-	imb1.image = s->vschimg[schimgi];
+	imb1.image = VK_NULL_HANDLE;
 	imb1.subresourceRange = (VkImageSubresourceRange){
 		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 		.baseMipLevel = 0,
@@ -555,45 +572,81 @@ void eventLoop(State *s) {
 		.baseArrayLayer = 0,
 		.layerCount = 1,
 	};
-	VkImageMemoryBarrier imb = {};
-	imb.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-	imb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-	imb.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-	imb.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-	imb.image = s->vschimg[schimgi];
-	imb.subresourceRange = (VkImageSubresourceRange){
+	VkImageMemoryBarrier2 imb2 = {};
+	imb2.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+	imb2.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+	imb2.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+	imb2.dstStageMask = VK_PIPELINE_STAGE_2_NONE,
+	imb2.dstAccessMask = VK_ACCESS_2_NONE,
+	imb2.oldLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
+	imb2.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	imb2.image = VK_NULL_HANDLE;
+	imb2.subresourceRange = (VkImageSubresourceRange){
 		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 		.baseMipLevel = 0,
 		.levelCount = 1,
 		.baseArrayLayer = 0,
 		.layerCount = 1,
 	};
+	VkImageMemoryBarrier2 imbs[] = {imb1, imb2};
+
+	VkDependencyInfo di = {};
+	di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+	di.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
+	di.imageMemoryBarrierCount = 2;
+	di.pImageMemoryBarriers = imbs;
 
 	while (!quit) {
 		while (SDL_PollEvent(&e) != 0) {
-			if (e.type == SDL_QUIT) quit = 1;
+			if (e.type == SDL_QUIT)
+				quit = 1;
+			else if (e.type == SDL_WINDOWEVENT) {
+				if (e.window.event == SDL_WINDOWEVENT_SIZE_CHANGED) {
+					resize = 1;
+				}
+			}
+		}
+
+		schi = (schi + 1) % s->vschimgc;
+
+		if (resize) {  // TODO: What if the size becomes 0x0?
+			resize = 0;
+			vkDeviceWaitIdle(s->vdev);
+			// destroy image views
+			for (uint32_t i = 0; i < s->vschimgc; i++)
+				vkDestroyImageView(s->vdev, s->vschimgv[i], NULL);
+			// destroy swap chain
+			vkDestroySwapchainKHR(s->vdev, s->vsch, NULL);
+			// recreate swap chain
+			createSwapchain(s);
+			// update variables
+			ri.renderArea.extent = s->imgext;
+			vp.width = s->imgext.width;
+			vp.height = s->imgext.height;
+			sc.extent = s->imgext;
 		}
 
 		// acquire image from swap chain, wait for an available command buffer
 
-		must(vkAcquireNextImageKHR(s->vdev, s->vsch, 3000000000, s->imgsem[schi], VK_NULL_HANDLE, &schimgi));
-		vkWaitForFences(s->vdev, 1, &s->cmdbfen[schi], VK_TRUE, UINT64_MAX);
+		VkResult ar = vkAcquireNextImageKHR(s->vdev, s->vsch, 3000000000, s->imgsem[schi], VK_NULL_HANDLE, &schimgi);
+		if (ar == VK_SUCCESS) {
+		} else if (ar == VK_ERROR_OUT_OF_DATE_KHR || ar == VK_SUBOPTIMAL_KHR) {
+			resize = 1;
+			continue;
+		} else {
+			panicf("failed to acquire swap chain image, VkResult=%d", ar);
+		}
+		must(vkWaitForFences(s->vdev, 1, &s->cmdbfen[schi], VK_TRUE, 3000000000));
 		vkResetFences(s->vdev, 1, &s->cmdbfen[schi]);
 		printFramerate();
 
 		// record command buffer
 
-		// TODO: synchronization2
-
 		must(vkBeginCommandBuffer(s->cmdb[schi], &(VkCommandBufferBeginInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}));
 
-		imb1.image = s->vschimg[schimgi];
-		imb.image = s->vschimg[schimgi];
-		vkCmdPipelineBarrier(
-			s->cmdb[schi],
-			VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-			0, 0, NULL, 0, NULL, 1, &imb1
-		);
+		imbs[0].image = s->vschimg[schimgi];
+		imbs[1].image = s->vschimg[schimgi];
+		vkCmdPipelineBarrier2(s->cmdb[schi], &di);
 		
 		ati.imageView = s->vschimgv[schimgi];
 
@@ -610,27 +663,32 @@ void eventLoop(State *s) {
 		vkCmdDraw(s->cmdb[schi], 3, 1, 0, 0);
 		vkCmdEndRendering(s->cmdb[schi]);
 
-		vkCmdPipelineBarrier(
-			s->cmdb[schi],
-			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-			0, 0, NULL, 0, NULL, 1, &imb
-		);
-
 		must(vkEndCommandBuffer(s->cmdb[schi]));
 
 		// submit command buffer
 
-		VkSubmitInfo si = {};
-		si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-		si.waitSemaphoreCount = 1;
-		si.pWaitSemaphores = &s->imgsem[schi];
-		si.pWaitDstStageMask = &(VkPipelineStageFlags){VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT};
-		si.commandBufferCount = 1;
-		si.pCommandBuffers = &s->cmdb[schi];
-		si.signalSemaphoreCount = 1;
-		si.pSignalSemaphores = &s->prsem[schi];
+		VkSubmitInfo2 si = {};
+		si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
+		si.waitSemaphoreInfoCount = 1;
+		si.pWaitSemaphoreInfos = &(VkSemaphoreSubmitInfo){
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+			.semaphore = s->imgsem[schi],
+			.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+		};
+		si.commandBufferInfoCount = 1;
+		si.pCommandBufferInfos = &(VkCommandBufferSubmitInfo){
+			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
+			.commandBuffer = s->cmdb[schi],
+		};
+		si.signalSemaphoreInfoCount = 1;
+		si.pSignalSemaphoreInfos = &(VkSemaphoreSubmitInfo){
+			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+			.semaphore = s->prsem[schi],
+			.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+			
+		};
 
-		must(vkQueueSubmit(s->queue, 1, &si, s->cmdbfen[schi]));
+		must(vkQueueSubmit2(s->queue, 1, &si, s->cmdbfen[schi]));
 
 		// present swap chain image
 
@@ -641,14 +699,19 @@ void eventLoop(State *s) {
 		pi.swapchainCount = 1;
 		pi.pSwapchains = &s->vsch;
 		pi.pImageIndices = &schimgi;
-		must(vkQueuePresentKHR(s->queue, &pi));
-
-		schi = (schi + 1) % s->vschimgc;
+		VkResult pr = vkQueuePresentKHR(s->queue, &pi);
+		if (pr == VK_SUCCESS) {
+		} else if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR) {
+			resize = 1;
+			continue;
+		} else {
+			panicf("failed to present swap chain image, VkResult=%d", pr);
+		}
 	}
 }
 
 int main() {
-	State s;
+	State s = {};
 	if (beginSdl(&s) != VK_SUCCESS) {
 		return 1;
 	}
