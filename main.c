@@ -40,12 +40,16 @@
 
 typedef struct State { // TODO: Some members are probably unneeded
 	SDL_Window *window;
-	VkDevice vdev;
 	VkPhysicalDevice vpd;
+	VkDevice vdev;
+	VmaAllocator vma;
 	VkSwapchainKHR vsch;
 	uint32_t vschimgc; // number of images in swapchain
 	VkImage *vschimg; // array of swapchain images
 	VkImageView *vschimgv;
+	VkImage dbi; // depth buffer
+	VmaAllocation dba;
+	VkImageView dbiv;
 	VkQueue queue;
 	VkPipeline pl;
 	VkCommandPool cmdpl;
@@ -190,7 +194,7 @@ void createSwapchain(State *s) {
 	VkSwapchainCreateInfoKHR schci = {};
 	schci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
 	schci.surface = s->vsurface;
-	schci.minImageCount = 3; // TODO: Think about choosing the right number
+	schci.minImageCount = imgc;
 	schci.imageFormat = s->vsurff.format;
 	schci.imageColorSpace = s->vsurff.colorSpace;
 	schci.imageExtent = imgext;
@@ -198,7 +202,7 @@ void createSwapchain(State *s) {
 	schci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 	schci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
 	schci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-	schci.presentMode = VK_PRESENT_MODE_MAILBOX_KHR; // TODO: either FIFO Relaxed or Mailbox, with FIFO as fallback maybe
+	schci.presentMode = VK_PRESENT_MODE_MAILBOX_KHR; // TODO: use FIFO Relaxed, with FIFO as fallback
 
 	must(vkCreateSwapchainKHR(s->vdev, &schci, NULL, &s->vsch));
 
@@ -236,6 +240,41 @@ void createSwapchain(State *s) {
 	}
 
 	infof("swapchain created (%"PRIu32" images, %"PRIu32"x%"PRIu32")", s->vschimgc, imgext.width, imgext.height);
+
+	// create depth buffer
+
+	VkImageCreateInfo ici = {};
+	ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+	ici.imageType = VK_IMAGE_TYPE_2D;
+	ici.format = VK_FORMAT_D32_SFLOAT;
+	ici.extent.width = s->imgext.width;
+	ici.extent.height = s->imgext.height;
+	ici.extent.depth = 1;
+	ici.mipLevels = 1;
+	ici.arrayLayers = 1;
+	ici.samples = VK_SAMPLE_COUNT_1_BIT;
+	ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+	ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+	VmaAllocationCreateInfo aci = {};
+	aci.usage = VMA_MEMORY_USAGE_AUTO;
+	aci.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+	must(vmaCreateImage(s->vma, &ici, &aci, &s->dbi, &s->dba, NULL));
+
+	VkImageViewCreateInfo ivci = {};
+	ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+	ivci.image = s->dbi;
+	ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+	ivci.format = VK_FORMAT_D32_SFLOAT;
+	ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+	ivci.subresourceRange.baseMipLevel = 0;
+	ivci.subresourceRange.levelCount = 1;
+	ivci.subresourceRange.baseArrayLayer = 0;
+	ivci.subresourceRange.layerCount = 1;
+	must(vkCreateImageView(s->vdev, &ivci, NULL, &s->dbiv));
+
+	infof("depth buffer created");
 }
 
 // initialize vulkan
@@ -356,6 +395,15 @@ void beginVulkan(State *s) {
 
 	infof("vulkan device created");
 
+	// create VMA allocator
+
+	VmaAllocatorCreateInfo aci = {};
+	aci.physicalDevice = s->vpd;
+	aci.device = s->vdev;
+	aci.instance = instance;
+	aci.vulkanApiVersion = ai.apiVersion;
+	must(vmaCreateAllocator(&aci, &s->vma));
+
 	// get the queue handle
 
 	vkGetDeviceQueue(dev, qfi, 0, &s->queue);
@@ -404,6 +452,7 @@ void beginVulkan(State *s) {
 	plrci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
 	plrci.colorAttachmentCount = 1;
 	plrci.pColorAttachmentFormats = &s->vsurff.format;
+	plrci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
 
 	VkGraphicsPipelineCreateInfo plci = {};
 	plci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -435,7 +484,12 @@ void beginVulkan(State *s) {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
 		.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
 	};
-	// TODO const VkPipelineDepthStencilStateCreateInfo*     pDepthStencilState;
+	plci.pDepthStencilState = &(VkPipelineDepthStencilStateCreateInfo){
+		.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
+		.depthTestEnable = VK_TRUE,
+		.depthWriteEnable = VK_TRUE,
+		.depthCompareOp = VK_COMPARE_OP_LESS,
+	};
 	plci.pColorBlendState = &(VkPipelineColorBlendStateCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
 		.attachmentCount = 1,
@@ -532,11 +586,20 @@ void eventLoop(State *s) {
 
 	VkRenderingAttachmentInfo ati = {};
 	ati.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-	ati.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+	ati.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
 	ati.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
 	ati.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
 	ati.clearValue = (VkClearValue){
 		.color = (VkClearColorValue){.float32 = {1, 1, 1, 1}},
+	};
+
+	VkRenderingAttachmentInfo dti = {};
+	dti.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+	dti.imageLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
+	dti.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+	dti.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+	dti.clearValue = (VkClearValue){
+		.depthStencil = (VkClearDepthStencilValue){.depth = 1.0f}, // TODO: ?
 	};
 
 	VkRenderingInfo ri = {};
@@ -545,6 +608,7 @@ void eventLoop(State *s) {
 	ri.layerCount = 1;
 	ri.colorAttachmentCount = 1;
 	ri.pColorAttachments = &ati;
+	ri.pDepthAttachment = &dti;
 	// TODO const VkRenderingAttachmentInfo*    pDepthAttachment;
 
 	VkViewport vp = {};
@@ -574,12 +638,12 @@ void eventLoop(State *s) {
 	};
 	VkImageMemoryBarrier2 imb2 = {};
 	imb2.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-	imb2.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-	imb2.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-	imb2.dstStageMask = VK_PIPELINE_STAGE_2_NONE,
-	imb2.dstAccessMask = VK_ACCESS_2_NONE,
-	imb2.oldLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL,
-	imb2.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+	imb2.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+	imb2.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+	imb2.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+	imb2.dstAccessMask = VK_ACCESS_2_NONE;
+	imb2.oldLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
+	imb2.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 	imb2.image = VK_NULL_HANDLE;
 	imb2.subresourceRange = (VkImageSubresourceRange){
 		.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -588,12 +652,44 @@ void eventLoop(State *s) {
 		.baseArrayLayer = 0,
 		.layerCount = 1,
 	};
-	VkImageMemoryBarrier2 imbs[] = {imb1, imb2};
+	VkImageMemoryBarrier2 dmb1 = {};
+	dmb1.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+	dmb1.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+	dmb1.srcAccessMask = VK_ACCESS_2_NONE;
+	dmb1.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+	dmb1.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	dmb1.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	dmb1.newLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
+	dmb1.image = VK_NULL_HANDLE;
+	dmb1.subresourceRange = (VkImageSubresourceRange){
+		.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+		.baseMipLevel = 0,
+		.levelCount = 1,
+		.baseArrayLayer = 0,
+		.layerCount = 1,
+	};
+	// VkImageMemoryBarrier2 dmb2 = {};
+	// dmb2.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+	// dmb2.srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+	// dmb2.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+	// dmb2.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
+	// dmb2.dstAccessMask = VK_ACCESS_2_NONE;
+	// dmb2.oldLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
+	// dmb2.newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+	// dmb2.image = s->dbi;
+	// dmb2.subresourceRange = (VkImageSubresourceRange){
+	// 	.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	// 	.baseMipLevel = 0,
+	// 	.levelCount = 1,
+	// 	.baseArrayLayer = 0,
+	// 	.layerCount = 1,
+	// };
+	VkImageMemoryBarrier2 imbs[] = {imb1, imb2, dmb1, /*dmb2*/};
 
 	VkDependencyInfo di = {};
 	di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
 	di.dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT;
-	di.imageMemoryBarrierCount = 2;
+	di.imageMemoryBarrierCount = LENGTH(imbs);
 	di.pImageMemoryBarriers = imbs;
 
 	while (!quit) {
@@ -612,11 +708,15 @@ void eventLoop(State *s) {
 		if (resize) {  // TODO: What if the size becomes 0x0?
 			resize = 0;
 			vkDeviceWaitIdle(s->vdev);
+			// destroy depth buffer
+			vkDestroyImageView(s->vdev, s->dbiv, NULL);
+			vmaDestroyImage(s->vma, s->dbi, s->dba);
 			// destroy image views
 			for (uint32_t i = 0; i < s->vschimgc; i++)
 				vkDestroyImageView(s->vdev, s->vschimgv[i], NULL);
 			// destroy swap chain
 			vkDestroySwapchainKHR(s->vdev, s->vsch, NULL);
+			infof("swapchain and depth buffer destroyed");
 			// recreate swap chain
 			createSwapchain(s);
 			// update variables
@@ -626,16 +726,20 @@ void eventLoop(State *s) {
 			sc.extent = s->imgext;
 		}
 
+		// TODO: Analyze the swapchain usage, paying attention to synchronization regarding the depth buffer,
+		//       Taking https://github.com/KhronosGroup/Vulkan-Samples/tree/main/samples/performance/swapchain_images into
+		//       consideration.
 		// acquire image from swap chain, wait for an available command buffer
 
 		VkResult ar = vkAcquireNextImageKHR(s->vdev, s->vsch, 3000000000, s->imgsem[schi], VK_NULL_HANDLE, &schimgi);
 		if (ar == VK_SUCCESS) {
-		} else if (ar == VK_ERROR_OUT_OF_DATE_KHR || ar == VK_SUBOPTIMAL_KHR) {
+		} else if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
 			resize = 1;
 			continue;
-		} else {
+		} else if (ar != VK_SUBOPTIMAL_KHR) {
 			panicf("failed to acquire swap chain image, VkResult=%d", ar);
 		}
+
 		must(vkWaitForFences(s->vdev, 1, &s->cmdbfen[schi], VK_TRUE, 3000000000));
 		vkResetFences(s->vdev, 1, &s->cmdbfen[schi]);
 		printFramerate();
@@ -646,10 +750,11 @@ void eventLoop(State *s) {
 
 		imbs[0].image = s->vschimg[schimgi];
 		imbs[1].image = s->vschimg[schimgi];
+		imbs[2].image = s->dbi;
 		vkCmdPipelineBarrier2(s->cmdb[schi], &di);
 		
 		ati.imageView = s->vschimgv[schimgi];
-
+		dti.imageView = s->dbiv;
 		vkCmdBeginRendering(s->cmdb[schi], &ri);
 
 		ri.renderArea.extent = s->imgext;
