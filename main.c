@@ -1,5 +1,4 @@
 #include "SDL_video.h"
-#include "vulkan_core.h"
 #include <SDL.h>
 #include <SDL_vulkan.h>
 #include <vulkan.h>
@@ -9,34 +8,11 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "util.h"
+#include "frame.h"
+
 #include "shaders_out/shader.vert.h"
 #include "shaders_out/shader.frag.h"
-
-// macro for printing informational messages
-#define infof(fmt, args...) printf("[info] " fmt "\n", ##args)
-
-// macro for printing errors
-#define errorf(fmt, args...) printf("[error] " fmt "\n", ##args)
-
-// like errorf, but exits
-#define panicf(fmt, args...) do {errorf(fmt, ##args); exit(1);} while(0)
-
-// checks if the result is VK_SUCCESS and exits otherwise
-#define must(result) do { \
-		VkResult r = result; \
-		if (r != VK_SUCCESS) { \
-			panicf(__FILE__":%d: function returned VkResult \"%d\", but VK_SUCCESS was expected.", __LINE__, r); \
-		} \
-	} while (0)
-
-// if pointer is null, prints error and exits
-#define mustPtr(ptr, fmt...) do { \
-		if (ptr == NULL) { \
-			panicf("pointer was null: " fmt); \
-		} \
-	} while (0);
-
-#define LENGTH(X) (sizeof X / sizeof X[0])
 
 typedef struct State { // TODO: Some members are probably unneeded
 	SDL_Window *window;
@@ -50,13 +26,11 @@ typedef struct State { // TODO: Some members are probably unneeded
 	VkImage dbi; // depth buffer
 	VmaAllocation dba;
 	VkImageView dbiv;
+	uint32_t qfi;
 	VkQueue queue;
 	VkPipeline pl;
-	VkCommandPool cmdpl;
-	VkCommandBuffer *cmdb;
 	VkSemaphore *imgsem; // image is ready to be drawn to
 	VkSemaphore *prsem; // ready to present
-	VkFence *cmdbfen; // ready to reuse cmd buffer
 	VkExtent2D imgext;
 	VkSurfaceKHR vsurface;
 	VkSurfaceFormatKHR vsurff;
@@ -352,19 +326,19 @@ void beginVulkan(State *s) {
 	VkQueueFamilyProperties *qfamp = calloc(qfamc, sizeof(VkQueueFamilyProperties));
 	mustPtr(qfamp, "queue family properties array, len = %"PRIu32, qfamc);
 	vkGetPhysicalDeviceQueueFamilyProperties(s->vpd, &qfamc, qfamp);
-	uint32_t qfi = qfamc;
+	s->qfi = qfamc;
 	for (uint32_t i = 0; i < qfamc; i++)
 		if ((qfamp[i].queueFlags & (VK_QUEUE_GRAPHICS_BIT|VK_QUEUE_COMPUTE_BIT))
 				== (VK_QUEUE_GRAPHICS_BIT|VK_QUEUE_COMPUTE_BIT)) {
-			qfi = i;
+			s->qfi = i;
 			break;
 		}
-	if (qfi == qfamc)
+	if (s->qfi == qfamc)
 		panicf("no queue family supporting graphics");
 
 	VkDeviceQueueCreateInfo qci = {};
 	qci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-	qci.queueFamilyIndex = qfi;
+	qci.queueFamilyIndex = s->qfi;
 	qci.queueCount = 1;
 	qci.pQueuePriorities = (float[]){1.0f};
 
@@ -406,7 +380,7 @@ void beginVulkan(State *s) {
 
 	// get the queue handle
 
-	vkGetDeviceQueue(dev, qfi, 0, &s->queue);
+	vkGetDeviceQueue(dev, s->qfi, 0, &s->queue);
 
 	// create vulkan rendering surface
 
@@ -522,25 +496,6 @@ void beginVulkan(State *s) {
 	plci.basePipelineIndex = 0;
 	must(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &plci, NULL, &s->pl));
 
-	// create command pool
-
-	VkCommandPoolCreateInfo cmdplci = {};
-	cmdplci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-	cmdplci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-	cmdplci.queueFamilyIndex = qfi;
-	must(vkCreateCommandPool(dev, &cmdplci, NULL, &s->cmdpl));
-
-	// allocate command buffers
-
-	s->cmdb = calloc(s->vschimgc, sizeof(VkCommandBuffer));
-	mustPtr(s->cmdb, "command buffers array, len = %"PRIu32, s->vschimgc);
-	VkCommandBufferAllocateInfo cmdbai = {};
-	cmdbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-	cmdbai.commandPool = s->cmdpl;
-	cmdbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-	cmdbai.commandBufferCount = s->vschimgc;
-	must(vkAllocateCommandBuffers(dev, &cmdbai, s->cmdb));
-
 	// create semaphores and fences
 
 	s->imgsem = calloc(s->vschimgc, sizeof(VkSemaphore));
@@ -551,13 +506,6 @@ void beginVulkan(State *s) {
 	mustPtr(s->prsem, "present semaphores array, len = %"PRIu32, s->vschimgc);
 	for (uint32_t i = 0; i < s->vschimgc; i++)
 		must(vkCreateSemaphore(dev, &(VkSemaphoreCreateInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}, NULL, &s->prsem[i]));
-	s->cmdbfen = calloc(s->vschimgc, sizeof(VkFence));
-	mustPtr(s->prsem, "command buffer fences array, len = %"PRIu32, s->vschimgc);
-	VkFenceCreateInfo cmdbfenci = {};
-	cmdbfenci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-	cmdbfenci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-	for (uint32_t i = 0; i < s->vschimgc; i++)
-		must(vkCreateFence(dev, &cmdbfenci, NULL, &s->cmdbfen[i]));
 }
 
 // cleanup vulkan
@@ -582,7 +530,12 @@ void eventLoop(State *s) {
 	char quit = 0;
 	char resize = 0;
 	uint32_t schimgi = 0;
-	uint32_t schi = 0;
+	uint32_t imgsemIndex = 0; // TODO: This is temporary
+
+	Frames frames = {};
+	frames.count = 2;
+	framesInit(&frames, s->vdev, s->qfi);
+	Frame *frame;
 
 	VkRenderingAttachmentInfo ati = {};
 	ati.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -609,7 +562,6 @@ void eventLoop(State *s) {
 	ri.colorAttachmentCount = 1;
 	ri.pColorAttachments = &ati;
 	ri.pDepthAttachment = &dti;
-	// TODO const VkRenderingAttachmentInfo*    pDepthAttachment;
 
 	VkViewport vp = {};
 	vp.width = s->imgext.width;
@@ -668,23 +620,7 @@ void eventLoop(State *s) {
 		.baseArrayLayer = 0,
 		.layerCount = 1,
 	};
-	// VkImageMemoryBarrier2 dmb2 = {};
-	// dmb2.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-	// dmb2.srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-	// dmb2.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-	// dmb2.dstStageMask = VK_PIPELINE_STAGE_2_NONE;
-	// dmb2.dstAccessMask = VK_ACCESS_2_NONE;
-	// dmb2.oldLayout = VK_IMAGE_LAYOUT_ATTACHMENT_OPTIMAL;
-	// dmb2.newLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-	// dmb2.image = s->dbi;
-	// dmb2.subresourceRange = (VkImageSubresourceRange){
-	// 	.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-	// 	.baseMipLevel = 0,
-	// 	.levelCount = 1,
-	// 	.baseArrayLayer = 0,
-	// 	.layerCount = 1,
-	// };
-	VkImageMemoryBarrier2 imbs[] = {imb1, imb2, dmb1, /*dmb2*/};
+	VkImageMemoryBarrier2 imbs[] = {imb1, imb2, dmb1};
 
 	VkDependencyInfo di = {};
 	di.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -703,7 +639,7 @@ void eventLoop(State *s) {
 			}
 		}
 
-		schi = (schi + 1) % s->vschimgc;
+		frame = framesNext(&frames);
 
 		if (resize) {  // TODO: What if the size becomes 0x0?
 			resize = 0;
@@ -731,7 +667,8 @@ void eventLoop(State *s) {
 		//       consideration.
 		// acquire image from swap chain, wait for an available command buffer
 
-		VkResult ar = vkAcquireNextImageKHR(s->vdev, s->vsch, 3000000000, s->imgsem[schi], VK_NULL_HANDLE, &schimgi);
+		imgsemIndex = (imgsemIndex + 1) % s->vschimgc;
+		VkResult ar = vkAcquireNextImageKHR(s->vdev, s->vsch, 3000000000, s->imgsem[imgsemIndex], VK_NULL_HANDLE, &schimgi);
 		if (ar == VK_SUCCESS) {
 		} else if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
 			resize = 1;
@@ -740,35 +677,38 @@ void eventLoop(State *s) {
 			panicf("failed to acquire swap chain image, VkResult=%d", ar);
 		}
 
-		must(vkWaitForFences(s->vdev, 1, &s->cmdbfen[schi], VK_TRUE, 3000000000));
-		vkResetFences(s->vdev, 1, &s->cmdbfen[schi]);
+		must(vkWaitForFences(s->vdev, 1, &frame->ready, VK_TRUE, 3000000000));
+		vkResetFences(s->vdev, 1, &frame->ready);
 		printFramerate();
 
 		// record command buffer
 
-		must(vkBeginCommandBuffer(s->cmdb[schi], &(VkCommandBufferBeginInfo){.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}));
+		VkCommandBufferBeginInfo cmdbbi = {};
+		cmdbbi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		cmdbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		must(vkBeginCommandBuffer(frame->cmdbuf, &cmdbbi));
 
 		imbs[0].image = s->vschimg[schimgi];
 		imbs[1].image = s->vschimg[schimgi];
 		imbs[2].image = s->dbi;
-		vkCmdPipelineBarrier2(s->cmdb[schi], &di);
+		vkCmdPipelineBarrier2(frame->cmdbuf, &di);
 		
 		ati.imageView = s->vschimgv[schimgi];
 		dti.imageView = s->dbiv;
-		vkCmdBeginRendering(s->cmdb[schi], &ri);
+		vkCmdBeginRendering(frame->cmdbuf, &ri);
 
 		ri.renderArea.extent = s->imgext;
 		vp.width = s->imgext.width;
 		vp.height = s->imgext.height;
-		vkCmdSetViewport(s->cmdb[schi], 0, 1, &vp);
-		vkCmdSetScissor(s->cmdb[schi], 0, 1, &sc);
+		vkCmdSetViewport(frame->cmdbuf, 0, 1, &vp);
+		vkCmdSetScissor(frame->cmdbuf, 0, 1, &sc);
 
-		vkCmdBindPipeline(s->cmdb[schi], VK_PIPELINE_BIND_POINT_GRAPHICS, s->pl);
+		vkCmdBindPipeline(frame->cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, s->pl);
 
-		vkCmdDraw(s->cmdb[schi], 3, 1, 0, 0);
-		vkCmdEndRendering(s->cmdb[schi]);
+		vkCmdDraw(frame->cmdbuf, 3, 1, 0, 0);
+		vkCmdEndRendering(frame->cmdbuf);
 
-		must(vkEndCommandBuffer(s->cmdb[schi]));
+		must(vkEndCommandBuffer(frame->cmdbuf));
 
 		// submit command buffer
 
@@ -777,30 +717,30 @@ void eventLoop(State *s) {
 		si.waitSemaphoreInfoCount = 1;
 		si.pWaitSemaphoreInfos = &(VkSemaphoreSubmitInfo){
 			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-			.semaphore = s->imgsem[schi],
+			.semaphore = s->imgsem[imgsemIndex],
 			.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
 		};
 		si.commandBufferInfoCount = 1;
 		si.pCommandBufferInfos = &(VkCommandBufferSubmitInfo){
 			.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-			.commandBuffer = s->cmdb[schi],
+			.commandBuffer = frame->cmdbuf,
 		};
 		si.signalSemaphoreInfoCount = 1;
 		si.pSignalSemaphoreInfos = &(VkSemaphoreSubmitInfo){
 			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-			.semaphore = s->prsem[schi],
+			.semaphore = s->prsem[schimgi],
 			.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
 			
 		};
 
-		must(vkQueueSubmit2(s->queue, 1, &si, s->cmdbfen[schi]));
+		must(vkQueueSubmit2(s->queue, 1, &si, frame->ready));
 
 		// present swap chain image
 
 		VkPresentInfoKHR pi = {};
 		pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
 		pi.waitSemaphoreCount = 1;
-		pi.pWaitSemaphores = &s->prsem[schi];
+		pi.pWaitSemaphores = &s->prsem[schimgi];
 		pi.swapchainCount = 1;
 		pi.pSwapchains = &s->vsch;
 		pi.pImageIndices = &schimgi;
