@@ -3,10 +3,10 @@
 // #include <stdio.h>
 
 // macro for printing informational messages
-#define infof(fmt, args...) printf("[info] " fmt "\n", ##args)
+#define infof(fmt, args...) printf("[info] "__FILE__":%d: " fmt "\n", __LINE__, ##args)
 
 // macro for printing errors
-#define errorf(fmt, args...) printf("[error] " fmt "\n", ##args)
+#define errorf(fmt, args...) printf("[error] "__FILE__":%d: " fmt "\n", __LINE__, ##args)
 
 // like errorf, but exits
 #define panicf(fmt, args...) do {errorf(fmt, ##args); exit(1);} while(0)
@@ -14,15 +14,21 @@
 // checks if the result is VK_SUCCESS and exits otherwise
 #define must(result) do { \
 		VkResult r = result; \
-		if (r != VK_SUCCESS) { \
+		if ((r) != VK_SUCCESS) { \
 			panicf(__FILE__":%d: function returned VkResult \"%d\", but VK_SUCCESS was expected.", __LINE__, r); \
 		} \
 	} while (0)
 
 // if pointer is null, prints error and exits
 #define mustPtr(ptr, fmt...) do { \
-		if (ptr == NULL) { \
+		if ((ptr) == NULL) { \
 			panicf("pointer was null: " fmt); \
+		} \
+	} while (0);
+
+#define mustCondition(cond, fmt...) do { \
+		if (!(cond)) { \
+			panicf("condition not met: " fmt); \
 		} \
 	} while (0);
 

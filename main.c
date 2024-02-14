@@ -10,6 +10,7 @@
 
 #include "util.h"
 #include "frame.h"
+#include "swapchain.h"
 
 #include "shaders_out/shader.vert.h"
 #include "shaders_out/shader.frag.h"
@@ -19,21 +20,14 @@ typedef struct State { // TODO: Some members are probably unneeded
 	VkPhysicalDevice vpd;
 	VkDevice vdev;
 	VmaAllocator vma;
-	VkSwapchainKHR vsch;
-	uint32_t vschimgc; // number of images in swapchain
-	VkImage *vschimg; // array of swapchain images
-	VkImageView *vschimgv;
 	VkImage dbi; // depth buffer
 	VmaAllocation dba;
 	VkImageView dbiv;
 	uint32_t qfi;
 	VkQueue queue;
 	VkPipeline pl;
-	VkSemaphore *imgsem; // image is ready to be drawn to
-	VkSemaphore *prsem; // ready to present
-	VkExtent2D imgext;
 	VkSurfaceKHR vsurface;
-	VkSurfaceFormatKHR vsurff;
+	Swapchain sc;
 } State;
 
 // initialize sdl and setup window
@@ -124,105 +118,13 @@ char checkDevExtensions(VkPhysicalDevice dev, uint32_t count, const char *exts[]
 	return found == count;
 }
 
-void createSwapchain(State *s) {
-	// initialize swapchain
-
-	if (s->vschimgc == 0) { // BUG: We assume that the format won't change
-		uint32_t srffc;
-		must(vkGetPhysicalDeviceSurfaceFormatsKHR(s->vpd, s->vsurface, &srffc, NULL));
-		VkSurfaceFormatKHR *srff = calloc(srffc, sizeof(VkSurfaceFormatKHR));
-		mustPtr(srff, "physical device surface formats array, len = %"PRIu32, srffc);
-		must(vkGetPhysicalDeviceSurfaceFormatsKHR(s->vpd, s->vsurface, &srffc, srff));
-		s->vsurff = srff[0];
-		for (uint32_t i = 0; i < srffc; i++) {
-			if (srff[i].format == VK_FORMAT_B8G8R8A8_SRGB && srff[i].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
-				s->vsurff = srff[i];
-		}
-		free(srff);
-	}
-
-	VkSurfaceCapabilitiesKHR srfcap = {};
-	must(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s->vpd, s->vsurface, &srfcap));
-
-	uint32_t imgc = 3;
-	if (imgc < srfcap.minImageCount)
-		imgc = srfcap.minImageCount;
-	if (imgc > srfcap.maxImageCount)
-		imgc = srfcap.maxImageCount;
-
-	VkExtent2D imgext = {1920, 1080};
-	if (srfcap.currentExtent.width != 0xFFFFFFFF || srfcap.currentExtent.height != 0xFFFFFFFF) {
-		imgext = srfcap.currentExtent;
-	} else {
-		if (imgext.width > srfcap.maxImageExtent.width)
-			imgext.width = srfcap.maxImageExtent.width;
-		if (imgext.height > srfcap.maxImageExtent.height)
-			imgext.height = srfcap.maxImageExtent.height;
-		if (imgext.width < srfcap.minImageExtent.width)
-			imgext.width = srfcap.minImageExtent.width;
-		if (imgext.height < srfcap.minImageExtent.height)
-			imgext.height = srfcap.minImageExtent.height;
-	}
-	s->imgext = imgext;
-
-	VkSwapchainCreateInfoKHR schci = {};
-	schci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
-	schci.surface = s->vsurface;
-	schci.minImageCount = imgc;
-	schci.imageFormat = s->vsurff.format;
-	schci.imageColorSpace = s->vsurff.colorSpace;
-	schci.imageExtent = imgext;
-	schci.imageArrayLayers = 1;
-	schci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-	schci.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-	schci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-	schci.presentMode = VK_PRESENT_MODE_MAILBOX_KHR; // TODO: use FIFO Relaxed, with FIFO as fallback
-
-	must(vkCreateSwapchainKHR(s->vdev, &schci, NULL, &s->vsch));
-
-	// get swapchain image handles
-
-	must(vkGetSwapchainImagesKHR(s->vdev, s->vsch, &s->vschimgc, NULL));
-	if (s->vschimg != NULL) {
-		s->vschimg = reallocarray(s->vschimg, s->vschimgc, sizeof(VkImage));
-	} else {
-		s->vschimg = calloc(s->vschimgc, sizeof(VkImage));
-	}
-	mustPtr(s->vschimg, "swapchain images array, len = %"PRIu32, s->vschimgc);
-	must(vkGetSwapchainImagesKHR(s->vdev, s->vsch, &s->vschimgc, s->vschimg));
-
-	// create swapchain image views
-
-	if (s->vschimgv != NULL) {
-		s->vschimgv = reallocarray(s->vschimgv, s->vschimgc, sizeof(VkImageView));
-	} else {
-		s->vschimgv = calloc(s->vschimgc, sizeof(VkImageView));
-	}
-	mustPtr(s->vschimgv, "swapchain image views array, len = %"PRIu32, s->vschimgc);
-	for (uint32_t i = 0; i < s->vschimgc; i++) {
-		VkImageViewCreateInfo ivci = {};
-		ivci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-		ivci.image = s->vschimg[i];
-		ivci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-		ivci.format = s->vsurff.format;
-		ivci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-		ivci.subresourceRange.baseMipLevel = 0;
-		ivci.subresourceRange.levelCount = 1;
-		ivci.subresourceRange.baseArrayLayer = 0;
-		ivci.subresourceRange.layerCount = 1;
-		must(vkCreateImageView(s->vdev, &ivci, NULL, &s->vschimgv[i]));
-	}
-
-	infof("swapchain created (%"PRIu32" images, %"PRIu32"x%"PRIu32")", s->vschimgc, imgext.width, imgext.height);
-
-	// create depth buffer
-
+void createDepthBuffer(State *s) {
 	VkImageCreateInfo ici = {};
 	ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	ici.imageType = VK_IMAGE_TYPE_2D;
 	ici.format = VK_FORMAT_D32_SFLOAT;
-	ici.extent.width = s->imgext.width;
-	ici.extent.height = s->imgext.height;
+	ici.extent.width = s->sc.extent.width;
+	ici.extent.height = s->sc.extent.height;
 	ici.extent.depth = 1;
 	ici.mipLevels = 1;
 	ici.arrayLayers = 1;
@@ -418,14 +320,20 @@ void beginVulkan(State *s) {
 
 	// create swapchain
 
-	createSwapchain(s);
+	VkSurfaceFormatKHR surffmt = swapchainGetFormat(s->vpd, s->vsurface);
+	swapchainConfigure(&s->sc, s->vpd, s->vsurface, 3, (VkExtent2D){1920, 1080});
+	swapchainInit(&s->sc, s->vdev, s->vsurface, surffmt);
+
+	// create depth buffer
+
+	createDepthBuffer(s);
 
 	// create graphics pipeline
 
 	VkPipelineRenderingCreateInfo plrci = {};
 	plrci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
 	plrci.colorAttachmentCount = 1;
-	plrci.pColorAttachmentFormats = &s->vsurff.format;
+	plrci.pColorAttachmentFormats = &surffmt.format;
 	plrci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
 
 	VkGraphicsPipelineCreateInfo plci = {};
@@ -495,17 +403,6 @@ void beginVulkan(State *s) {
 	plci.basePipelineHandle = VK_NULL_HANDLE;
 	plci.basePipelineIndex = 0;
 	must(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &plci, NULL, &s->pl));
-
-	// create semaphores and fences
-
-	s->imgsem = calloc(s->vschimgc, sizeof(VkSemaphore));
-	mustPtr(s->imgsem, "image semaphores array, len = %"PRIu32, s->vschimgc);
-	for (uint32_t i = 0; i < s->vschimgc; i++)
-		must(vkCreateSemaphore(dev, &(VkSemaphoreCreateInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}, NULL, &s->imgsem[i]));
-	s->prsem = calloc(s->vschimgc, sizeof(VkSemaphore));
-	mustPtr(s->prsem, "present semaphores array, len = %"PRIu32, s->vschimgc);
-	for (uint32_t i = 0; i < s->vschimgc; i++)
-		must(vkCreateSemaphore(dev, &(VkSemaphoreCreateInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO}, NULL, &s->prsem[i]));
 }
 
 // cleanup vulkan
@@ -530,7 +427,7 @@ void eventLoop(State *s) {
 	char quit = 0;
 	char resize = 0;
 	uint32_t schimgi = 0;
-	uint32_t imgsemIndex = 0; // TODO: This is temporary
+	uint32_t drawReadySemIndex = 0;
 
 	Frames frames = {};
 	frames.count = 2;
@@ -557,20 +454,20 @@ void eventLoop(State *s) {
 
 	VkRenderingInfo ri = {};
 	ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-	ri.renderArea.extent = s->imgext;
+	ri.renderArea.extent = s->sc.extent;
 	ri.layerCount = 1;
 	ri.colorAttachmentCount = 1;
 	ri.pColorAttachments = &ati;
 	ri.pDepthAttachment = &dti;
 
 	VkViewport vp = {};
-	vp.width = s->imgext.width;
-	vp.height = s->imgext.height;
+	vp.width = s->sc.extent.width;
+	vp.height = s->sc.extent.height;
 	vp.minDepth = 0;
 	vp.maxDepth = 1;
 
-	VkRect2D sc = {};
-	sc.extent = s->imgext;
+	VkRect2D scis = {};
+	scis.extent = s->sc.extent;
 
 	VkImageMemoryBarrier2 imb1 = {};
 	imb1.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -643,23 +540,19 @@ void eventLoop(State *s) {
 
 		if (resize) {  // TODO: What if the size becomes 0x0?
 			resize = 0;
-			vkDeviceWaitIdle(s->vdev);
+			must(vkDeviceWaitIdle(s->vdev));
 			// destroy depth buffer
 			vkDestroyImageView(s->vdev, s->dbiv, NULL);
 			vmaDestroyImage(s->vma, s->dbi, s->dba);
-			// destroy image views
-			for (uint32_t i = 0; i < s->vschimgc; i++)
-				vkDestroyImageView(s->vdev, s->vschimgv[i], NULL);
-			// destroy swap chain
-			vkDestroySwapchainKHR(s->vdev, s->vsch, NULL);
-			infof("swapchain and depth buffer destroyed");
 			// recreate swap chain
-			createSwapchain(s);
+			swapchainResize(&s->sc, s->vdev, s->vpd, s->vsurface);
+			// recreate depth buffer
+			createDepthBuffer(s);
 			// update variables
-			ri.renderArea.extent = s->imgext;
-			vp.width = s->imgext.width;
-			vp.height = s->imgext.height;
-			sc.extent = s->imgext;
+			ri.renderArea.extent = s->sc.extent;
+			vp.width = s->sc.extent.width;
+			vp.height = s->sc.extent.height;
+			scis.extent = s->sc.extent;
 		}
 
 		// TODO: Analyze the swapchain usage, paying attention to synchronization regarding the depth buffer,
@@ -667,8 +560,9 @@ void eventLoop(State *s) {
 		//       consideration.
 		// acquire image from swap chain, wait for an available command buffer
 
-		imgsemIndex = (imgsemIndex + 1) % s->vschimgc;
-		VkResult ar = vkAcquireNextImageKHR(s->vdev, s->vsch, 3000000000, s->imgsem[imgsemIndex], VK_NULL_HANDLE, &schimgi);
+		drawReadySemIndex = swapchainSemsReserve(&s->sc.drawReady);
+		VkResult ar = vkAcquireNextImageKHR(s->vdev, s->sc.chain, 3000000000, s->sc.drawReady.sem[drawReadySemIndex], VK_NULL_HANDLE, &schimgi);
+		swapchainsSemsAssociate(&s->sc.drawReady, drawReadySemIndex, schimgi);
 		if (ar == VK_SUCCESS) {
 		} else if (ar == VK_ERROR_OUT_OF_DATE_KHR) {
 			resize = 1;
@@ -688,20 +582,20 @@ void eventLoop(State *s) {
 		cmdbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 		must(vkBeginCommandBuffer(frame->cmdbuf, &cmdbbi));
 
-		imbs[0].image = s->vschimg[schimgi];
-		imbs[1].image = s->vschimg[schimgi];
+		imbs[0].image = s->sc.img[schimgi];
+		imbs[1].image = s->sc.img[schimgi];
 		imbs[2].image = s->dbi;
 		vkCmdPipelineBarrier2(frame->cmdbuf, &di);
 		
-		ati.imageView = s->vschimgv[schimgi];
+		ati.imageView = s->sc.imgv[schimgi];
 		dti.imageView = s->dbiv;
 		vkCmdBeginRendering(frame->cmdbuf, &ri);
 
-		ri.renderArea.extent = s->imgext;
-		vp.width = s->imgext.width;
-		vp.height = s->imgext.height;
+		ri.renderArea.extent = s->sc.extent;
+		vp.width = s->sc.extent.width;
+		vp.height = s->sc.extent.height;
 		vkCmdSetViewport(frame->cmdbuf, 0, 1, &vp);
-		vkCmdSetScissor(frame->cmdbuf, 0, 1, &sc);
+		vkCmdSetScissor(frame->cmdbuf, 0, 1, &scis);
 
 		vkCmdBindPipeline(frame->cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, s->pl);
 
@@ -717,7 +611,7 @@ void eventLoop(State *s) {
 		si.waitSemaphoreInfoCount = 1;
 		si.pWaitSemaphoreInfos = &(VkSemaphoreSubmitInfo){
 			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-			.semaphore = s->imgsem[imgsemIndex],
+			.semaphore = s->sc.drawReady.sem[drawReadySemIndex],
 			.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
 		};
 		si.commandBufferInfoCount = 1;
@@ -728,7 +622,7 @@ void eventLoop(State *s) {
 		si.signalSemaphoreInfoCount = 1;
 		si.pSignalSemaphoreInfos = &(VkSemaphoreSubmitInfo){
 			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-			.semaphore = s->prsem[schimgi],
+			.semaphore = s->sc.presReady[schimgi],
 			.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
 			
 		};
@@ -740,9 +634,9 @@ void eventLoop(State *s) {
 		VkPresentInfoKHR pi = {};
 		pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
 		pi.waitSemaphoreCount = 1;
-		pi.pWaitSemaphores = &s->prsem[schimgi];
+		pi.pWaitSemaphores = &s->sc.presReady[schimgi];
 		pi.swapchainCount = 1;
-		pi.pSwapchains = &s->vsch;
+		pi.pSwapchains = &s->sc.chain;
 		pi.pImageIndices = &schimgi;
 		VkResult pr = vkQueuePresentKHR(s->queue, &pi);
 		if (pr == VK_SUCCESS) {
