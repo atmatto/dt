@@ -9,4 +9,4 @@ for basename in main frame swapchain; do
     gcc -g -Wall -Wextra -c -o "obj/${basename}.o" "${basename}.c" -I/usr/include/SDL2 -I/usr/include/vulkan -I/usr/include
 done
 # Link everything
-gcc -lstdc++ -o main obj/*.o -L/usr/lib -lSDL2 -lvulkan
+gcc -lstdc++ -o main obj/*.o -L/usr/lib -lSDL2 -lvulkan -lcglm

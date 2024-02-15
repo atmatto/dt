@@ -3,6 +3,7 @@
 #include <SDL_vulkan.h>
 #include <vulkan.h>
 #include <vk_mem_alloc.h>
+#include <cglm/cglm.h>
 
 #include <stdlib.h>
 #include <stdio.h>
@@ -28,7 +29,21 @@ typedef struct State { // TODO: Some members are probably unneeded
 	VkPipeline pl;
 	VkSurfaceKHR vsurface;
 	Swapchain sc;
+	VkBuffer vb;
+	VmaAllocation vba;
 } State;
+
+vec3 vertices[] = {
+	{0.0f, 0.0f, 0.0f},
+	{0.0f, 0.5f, 0.0f},
+	{0.2f, 0.7f, 0.7f},
+	{0.2f, 0.2f, 0.2f},
+	{0.2f, 0.4f, 0.3f},
+	{0.6f, 0.25f, 0.5f},
+	{0.4f, 0.6f, 0.5f},
+	{0.8f, 0.9f, 0.3f},
+	{0.6f, 0.7f, 0.2f},
+};
 
 // initialize sdl and setup window
 VkResult beginSdl(State *s) {
@@ -328,6 +343,26 @@ void beginVulkan(State *s) {
 
 	createDepthBuffer(s);
 
+	// create vertex buffer
+
+	VkBufferCreateInfo bci = {};
+	bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	bci.size = sizeof(vertices);
+	bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+	bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VmaAllocationCreateInfo baci = {};
+	baci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+	baci.usage = VMA_MEMORY_USAGE_AUTO;
+	baci.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	must(vmaCreateBuffer(s->vma, &bci, &baci, &s->vb, &s->vba, NULL));
+
+	// fill vertex buffer
+
+	void *vbdata;
+	must(vmaMapMemory(s->vma, s->vba, &vbdata));
+	memcpy(vbdata, vertices, sizeof(vertices));
+	vmaUnmapMemory(s->vma, s->vba);
+
 	// create graphics pipeline
 
 	VkPipelineRenderingCreateInfo plrci = {};
@@ -343,7 +378,14 @@ void beginVulkan(State *s) {
 	plci.pStages = psci;
 	plci.pVertexInputState = &(VkPipelineVertexInputStateCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-		// TODO: Vertices are currently hardcoded
+		.vertexBindingDescriptionCount = 1,
+		.pVertexBindingDescriptions = &(VkVertexInputBindingDescription){
+			0, sizeof(vec3), VK_VERTEX_INPUT_RATE_VERTEX
+		},
+		.vertexAttributeDescriptionCount = 1,
+		.pVertexAttributeDescriptions = &(VkVertexInputAttributeDescription){
+			0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0
+		},
 	};
 	plci.pInputAssemblyState = &(VkPipelineInputAssemblyStateCreateInfo){
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -538,7 +580,9 @@ void eventLoop(State *s) {
 
 		frame = framesNext(&frames);
 
-		if (resize) {  // TODO: What if the size becomes 0x0?
+		if (resize) {
+			// TODO: What if the size becomes 0x0?
+			// TODO: Sometimes after resizing the window, the swapchain is being continuously recreated without drawing anything.
 			resize = 0;
 			must(vkDeviceWaitIdle(s->vdev));
 			// destroy depth buffer
@@ -555,9 +599,6 @@ void eventLoop(State *s) {
 			scis.extent = s->sc.extent;
 		}
 
-		// TODO: Analyze the swapchain usage, paying attention to synchronization regarding the depth buffer,
-		//       Taking https://github.com/KhronosGroup/Vulkan-Samples/tree/main/samples/performance/swapchain_images into
-		//       consideration.
 		// acquire image from swap chain, wait for an available command buffer
 
 		drawReadySemIndex = swapchainSemsReserve(&s->sc.drawReady);
@@ -598,8 +639,9 @@ void eventLoop(State *s) {
 		vkCmdSetScissor(frame->cmdbuf, 0, 1, &scis);
 
 		vkCmdBindPipeline(frame->cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, s->pl);
+		vkCmdBindVertexBuffers(frame->cmdbuf, 0, 1, &s->vb, (VkDeviceSize[]){0});
 
-		vkCmdDraw(frame->cmdbuf, 3, 1, 0, 0);
+		vkCmdDraw(frame->cmdbuf, LENGTH(vertices), 1, 0, 0);
 		vkCmdEndRendering(frame->cmdbuf);
 
 		must(vkEndCommandBuffer(frame->cmdbuf));
