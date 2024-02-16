@@ -15,6 +15,7 @@
 
 #include "shaders_out/shader.vert.h"
 #include "shaders_out/shader.frag.h"
+#include "vulkan_core.h"
 
 typedef struct State { // TODO: Some members are probably unneeded
 	SDL_Window *window;
@@ -29,8 +30,12 @@ typedef struct State { // TODO: Some members are probably unneeded
 	VkPipeline pl;
 	VkSurfaceKHR vsurface;
 	Swapchain sc;
+	// vertex buffer
 	VkBuffer vb;
 	VmaAllocation vba;
+	// index buffer
+	VkBuffer ib;
+	VmaAllocation iba;
 } State;
 
 vec3 vertices[] = {
@@ -43,6 +48,13 @@ vec3 vertices[] = {
 	{0.4f, 0.6f, 0.5f},
 	{0.8f, 0.9f, 0.3f},
 	{0.6f, 0.7f, 0.2f},
+};
+
+uint32_t indices[] = {
+	0, 1, 2,
+	3, 4, 5,
+	6, 7, 8,
+	2, 5, 8,
 };
 
 // initialize sdl and setup window
@@ -345,16 +357,31 @@ void beginVulkan(State *s) {
 
 	// create vertex buffer
 
-	VkBufferCreateInfo bci = {};
-	bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-	bci.size = sizeof(vertices);
-	bci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
-	bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-	VmaAllocationCreateInfo baci = {};
-	baci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
-	baci.usage = VMA_MEMORY_USAGE_AUTO;
-	baci.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-	must(vmaCreateBuffer(s->vma, &bci, &baci, &s->vb, &s->vba, NULL));
+	VkBufferCreateInfo vbci = {};
+	vbci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	vbci.size = sizeof(vertices);
+	vbci.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+	vbci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VmaAllocationCreateInfo vbaci = {};
+	vbaci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+	vbaci.usage = VMA_MEMORY_USAGE_AUTO;
+	vbaci.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	must(vmaCreateBuffer(s->vma, &vbci, &vbaci, &s->vb, &s->vba, NULL));
+
+	// create index buffer
+
+	VkBufferCreateInfo ibci = {};
+	ibci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	ibci.size = sizeof(indices);
+	ibci.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+	ibci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VmaAllocationCreateInfo ibaci = {};
+	ibaci.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT;
+	ibaci.usage = VMA_MEMORY_USAGE_AUTO;
+	ibaci.requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+	must(vmaCreateBuffer(s->vma, &ibci, &ibaci, &s->ib, &s->iba, NULL));
+
+	// TODO: Consider using a single allocation/buffer instead of separate ones.
 
 	// fill vertex buffer
 
@@ -362,6 +389,13 @@ void beginVulkan(State *s) {
 	must(vmaMapMemory(s->vma, s->vba, &vbdata));
 	memcpy(vbdata, vertices, sizeof(vertices));
 	vmaUnmapMemory(s->vma, s->vba);
+
+	// fill index buffer
+
+	void *ibdata;
+	must(vmaMapMemory(s->vma, s->iba, &ibdata));
+	memcpy(ibdata, indices, sizeof(indices));
+	vmaUnmapMemory(s->vma, s->iba);
 
 	// create graphics pipeline
 
@@ -640,8 +674,9 @@ void eventLoop(State *s) {
 
 		vkCmdBindPipeline(frame->cmdbuf, VK_PIPELINE_BIND_POINT_GRAPHICS, s->pl);
 		vkCmdBindVertexBuffers(frame->cmdbuf, 0, 1, &s->vb, (VkDeviceSize[]){0});
+		vkCmdBindIndexBuffer(frame->cmdbuf, s->ib, 0, VK_INDEX_TYPE_UINT32);
 
-		vkCmdDraw(frame->cmdbuf, LENGTH(vertices), 1, 0, 0);
+		vkCmdDrawIndexed(frame->cmdbuf, LENGTH(indices), 1, 0, 0, 0);
 		vkCmdEndRendering(frame->cmdbuf);
 
 		must(vkEndCommandBuffer(frame->cmdbuf));
